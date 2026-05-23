@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import Head from 'next/head'
+import { useRouter } from 'next/router'
+import { supabase } from '../lib/supabase'
 
 // ── DADOS ──────────────────────────────────────────────────
 const DAILY_MESSAGES = [
@@ -116,20 +118,37 @@ function HomeScreen({ onNav, onOpenRitual }) {
 }
 
 // ── TELA: MINHA MENTE ───────────────────────────────────────
-function MenteScreen() {
+function MenteScreen({ user }) {
   const [text, setText] = useState('')
   const [entries, setEntries] = useState([])
 
-  const save = () => {
+  useEffect(() => {
+    if (!user) return
+    supabase.from('mind_entries').select('*').eq('user_id', user.id).order('created_at', { ascending: false })
+      .then(({ data }) => {
+        if (data) setEntries(data.map(e => ({
+          id: e.id, text: e.text,
+          time: new Date(e.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }) +
+            ' · ' + new Date(e.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+        })))
+      })
+  }, [user])
+
+  const save = async () => {
     if (!text.trim()) return
-    const now = new Date()
-    const time = now.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }) +
-      ' · ' + now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
-    setEntries(prev => [{ id: Date.now(), text: text.trim(), time }, ...prev])
-    setText('')
+    const { data, error } = await supabase.from('mind_entries').insert({ user_id: user.id, text: text.trim() }).select().single()
+    if (!error && data) {
+      const now = new Date(data.created_at)
+      const time = now.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }) + ' · ' + now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+      setEntries(prev => [{ id: data.id, text: data.text, time }, ...prev])
+      setText('')
+    }
   }
 
-  const del = (id) => setEntries(prev => prev.filter(e => e.id !== id))
+  const del = async (id) => {
+    await supabase.from('mind_entries').delete().eq('id', id).eq('user_id', user.id)
+    setEntries(prev => prev.filter(e => e.id !== id))
+  }
 
   return (
     <div>
@@ -162,16 +181,39 @@ function MenteScreen() {
 }
 
 // ── TELA: SEMANA ────────────────────────────────────────────
-function SemanaScreen() {
+function SemanaScreen({ user }) {
   const [selectedDay, setSelectedDay] = useState(new Date())
   const [fixedTasks, setFixedTasks]   = useState([])
-  const [doneFixed, setDoneFixed]     = useState({}) // { dateKey: [id,...] }
-  const [pontual, setPontual]         = useState({}) // { dateKey: [{id,text,done}] }
+  const [doneFixed, setDoneFixed]     = useState({})
+  const [pontual, setPontual]         = useState({})
   const [showFixed, setShowFixed]     = useState(false)
   const [showPontual, setShowPontual] = useState(false)
   const [fixedText, setFixedText]     = useState('')
   const [fixedDays, setFixedDays]     = useState([new Date().getDay()])
   const [pontualText, setPontualText] = useState('')
+
+  // Carregar tarefas fixas do Supabase
+  useEffect(() => {
+    if (!user) return
+    supabase.from('fixed_tasks').select('*').eq('user_id', user.id).order('created_at')
+      .then(({ data }) => {
+        if (data) setFixedTasks(data.map(t => ({ ...t, days: t.days.split(',').map(Number) })))
+      })
+  }, [user])
+
+  // Carregar pontuais e dones do dia selecionado
+  useEffect(() => {
+    if (!user) return
+    const dk = dateKey(selectedDay)
+    supabase.from('pontual_tasks').select('*').eq('user_id', user.id).eq('date_key', dk)
+      .then(({ data }) => {
+        if (data) setPontual(prev => ({ ...prev, [dk]: data.map(t => ({ id: t.id, text: t.text, done: t.done })) }))
+      })
+    supabase.from('fixed_task_done').select('fixed_task_id').eq('user_id', user.id).eq('date_key', dk)
+      .then(({ data }) => {
+        if (data) setDoneFixed(prev => ({ ...prev, [dk]: data.map(d => d.fixed_task_id) }))
+      })
+  }, [user, selectedDay])
 
   // Gerar 14 dias (semana atual + próxima)
   const days = Array.from({ length: 14 }, (_, i) => {
@@ -192,36 +234,46 @@ function SemanaScreen() {
     prev.includes(i) ? prev.filter(d => d !== i) : [...prev, i]
   )
 
-  const saveFixed = () => {
+  const saveFixed = async () => {
     if (!fixedText.trim() || fixedDays.length === 0) return
-    setFixedTasks(prev => [...prev, { id: Date.now(), text: fixedText.trim(), days: [...fixedDays] }])
-    setFixedText(''); setFixedDays([dow]); setShowFixed(false)
+    const daysStr = fixedDays.join(',')
+    const { data, error } = await supabase.from('fixed_tasks').insert({ user_id: user.id, text: fixedText.trim(), days: daysStr }).select().single()
+    if (!error && data) {
+      setFixedTasks(prev => [...prev, { ...data, days: data.days.split(',').map(Number) }])
+      setFixedText(''); setFixedDays([dow]); setShowFixed(false)
+    }
   }
 
-  const toggleFixed = (id) => {
-    setDoneFixed(prev => {
-      const arr = prev[dk] || []
-      return { ...prev, [dk]: arr.includes(id) ? arr.filter(x => x !== id) : [...arr, id] }
-    })
+  const toggleFixed = async (id) => {
+    const arr = doneFixed[dk] || []
+    const isDone = arr.includes(id)
+    if (isDone) {
+      await supabase.from('fixed_task_done').delete().eq('user_id', user.id).eq('fixed_task_id', id).eq('date_key', dk)
+      setDoneFixed(prev => ({ ...prev, [dk]: arr.filter(x => x !== id) }))
+    } else {
+      await supabase.from('fixed_task_done').insert({ user_id: user.id, fixed_task_id: id, date_key: dk })
+      setDoneFixed(prev => ({ ...prev, [dk]: [...arr, id] }))
+    }
   }
 
-  const savePontual = () => {
+  const savePontual = async () => {
     if (!pontualText.trim()) return
-    setPontual(prev => ({
-      ...prev,
-      [dk]: [...(prev[dk] || []), { id: Date.now(), text: pontualText.trim(), done: false }]
-    }))
-    setPontualText(''); setShowPontual(false)
+    const { data, error } = await supabase.from('pontual_tasks').insert({ user_id: user.id, text: pontualText.trim(), date_key: dk, done: false }).select().single()
+    if (!error && data) {
+      setPontual(prev => ({ ...prev, [dk]: [...(prev[dk] || []), { id: data.id, text: data.text, done: false }] }))
+      setPontualText(''); setShowPontual(false)
+    }
   }
 
-  const togglePontual = (id) => {
-    setPontual(prev => ({
-      ...prev,
-      [dk]: (prev[dk] || []).map(t => t.id === id ? { ...t, done: !t.done } : t)
-    }))
+  const togglePontual = async (id) => {
+    const task = (pontual[dk] || []).find(t => t.id === id)
+    if (!task) return
+    await supabase.from('pontual_tasks').update({ done: !task.done }).eq('id', id).eq('user_id', user.id)
+    setPontual(prev => ({ ...prev, [dk]: (prev[dk] || []).map(t => t.id === id ? { ...t, done: !t.done } : t) }))
   }
 
-  const delPontual = (id) => {
+  const delPontual = async (id) => {
+    await supabase.from('pontual_tasks').delete().eq('id', id).eq('user_id', user.id)
     setPontual(prev => ({ ...prev, [dk]: (prev[dk] || []).filter(t => t.id !== id) }))
   }
 
@@ -285,7 +337,10 @@ function SemanaScreen() {
                 <div className="wtText">{t.text}</div>
                 <div className="wtDays">{t.days.map(i => DAY_NAMES[i]).join(' · ')}</div>
               </div>
-              <button className="wtDel" onClick={() => setFixedTasks(prev => prev.filter(x => x.id !== t.id))}>×</button>
+              <button className="wtDel" onClick={async () => {
+                await supabase.from('fixed_tasks').delete().eq('id', t.id).eq('user_id', user.id)
+                setFixedTasks(prev => prev.filter(x => x.id !== t.id))
+              }}>×</button>
             </div>
           ))
         }
@@ -327,14 +382,18 @@ function SemanaScreen() {
 }
 
 // ── TELA: LISTAS ────────────────────────────────────────────
-function ListasScreen() {
-  const [cats, setCats]         = useState([
-    { id: 1, icon: '💡', name: 'Ideias', items: [] },
-    { id: 2, icon: '🏠', name: 'Casa', items: [] },
-    { id: 3, icon: '🌸', name: 'Pra mim', items: [] },
-  ])
+function ListasScreen({ user }) {
+  const [cats, setCats]         = useState([])
   const [openCat, setOpenCat]   = useState(null)
   const [showForm, setShowForm] = useState(false)
+
+  useEffect(() => {
+    if (!user) return
+    supabase.from('categories').select('*, category_items(*)').eq('user_id', user.id).order('created_at')
+      .then(({ data }) => {
+        if (data) setCats(data.map(c => ({ ...c, items: (c.category_items || []).map(i => ({ ...i, done: !!i.done })) })))
+      })
+  }, [user])
   const [newName, setNewName]   = useState('')
   const [newEmoji, setNewEmoji] = useState('✨')
   const [showEmoji, setShowEmoji] = useState(false)
@@ -345,40 +404,42 @@ function ListasScreen() {
   const doneItems    = cats.reduce((s, c) => s + c.items.filter(i => i.done).length, 0)
   const progressPct  = totalItems > 0 ? Math.round((doneItems / totalItems) * 100) : 0
 
-  const saveCat = () => {
+  const saveCat = async () => {
     if (!newName.trim()) return
-    setCats(prev => [...prev, { id: Date.now(), icon: newEmoji, name: newName.trim(), items: [] }])
-    setNewName(''); setNewEmoji('✨'); setShowForm(false); setShowEmoji(false)
+    const { data, error } = await supabase.from('categories').insert({ user_id: user.id, icon: newEmoji, name: newName.trim() }).select().single()
+    if (!error && data) {
+      setCats(prev => [...prev, { ...data, items: [] }])
+      setNewName(''); setNewEmoji('✨'); setShowForm(false); setShowEmoji(false)
+    }
   }
 
-  const deleteCat = (id) => {
+  const deleteCat = async (id) => {
     if (!confirm('Apagar esta lista?')) return
+    await supabase.from('categories').delete().eq('id', id).eq('user_id', user.id)
     setCats(prev => prev.filter(c => c.id !== id))
     setOpenCat(null)
   }
 
-  const addItem = () => {
+  const addItem = async () => {
     if (!itemText.trim() || !openCat) return
-    setCats(prev => prev.map(c => c.id === openCat.id
-      ? { ...c, items: [{ id: Date.now(), text: itemText.trim(), done: false }, ...c.items] }
-      : c
-    ))
-    setItemText('')
-    setCats(prev => { const c = prev.find(x => x.id === openCat.id); if (c) setOpenCat(c); return prev })
+    const { data, error } = await supabase.from('category_items').insert({ user_id: user.id, category_id: openCat.id, text: itemText.trim(), done: false }).select().single()
+    if (!error && data) {
+      setCats(prev => prev.map(c => c.id === openCat.id ? { ...c, items: [{ ...data, done: false }, ...c.items] } : c))
+      setItemText('')
+    }
   }
 
-  const toggleItem = (catId, itemId) => {
-    setCats(prev => prev.map(c => c.id === catId
-      ? { ...c, items: c.items.map(i => i.id === itemId ? { ...i, done: !i.done } : i) }
-      : c
-    ))
+  const toggleItem = async (catId, itemId) => {
+    const cat = cats.find(c => c.id === catId)
+    const item = cat?.items.find(i => i.id === itemId)
+    if (!item) return
+    await supabase.from('category_items').update({ done: !item.done }).eq('id', itemId).eq('user_id', user.id)
+    setCats(prev => prev.map(c => c.id === catId ? { ...c, items: c.items.map(i => i.id === itemId ? { ...i, done: !i.done } : i) } : c))
   }
 
-  const deleteItem = (catId, itemId) => {
-    setCats(prev => prev.map(c => c.id === catId
-      ? { ...c, items: c.items.filter(i => i.id !== itemId) }
-      : c
-    ))
+  const deleteItem = async (catId, itemId) => {
+    await supabase.from('category_items').delete().eq('id', itemId).eq('user_id', user.id)
+    setCats(prev => prev.map(c => c.id === catId ? { ...c, items: c.items.filter(i => i.id !== itemId) } : c))
   }
 
   // Sincronizar openCat quando cats mudar
@@ -605,10 +666,31 @@ function RitualModal({ onClose }) {
 
 // ── APP PRINCIPAL ───────────────────────────────────────────
 export default function Home() {
-  const [entered, setEntered]     = useState(false)
-  const [hiding, setHiding]       = useState(false)
-  const [tab, setTab]             = useState('home')
+  const router = useRouter()
+  const [user, setUser]             = useState(null)
+  const [checking, setChecking]     = useState(true)
+  const [entered, setEntered]       = useState(false)
+  const [hiding, setHiding]         = useState(false)
+  const [tab, setTab]               = useState('home')
   const [showRitual, setShowRitual] = useState(false)
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) { router.push('/login'); return }
+      setUser(session.user)
+      setChecking(false)
+    })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session) { router.push('/login'); return }
+      setUser(session.user)
+    })
+    return () => subscription.unsubscribe()
+  }, [])
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut()
+    router.push('/login')
+  }
 
   const enter = () => {
     setHiding(true)
@@ -620,6 +702,12 @@ export default function Home() {
     window.scrollTo(0, 0)
   }
 
+  if (checking) return (
+    <div style={{ minHeight: '100vh', background: 'var(--bege)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div className="breathDot" />
+    </div>
+  )
+
   return (
     <>
       <Head>
@@ -627,7 +715,6 @@ export default function Home() {
         <meta name="description" content="Você merece descansar. Comece agora." />
       </Head>
 
-      {/* SPLASH */}
       {!entered && (
         <div className={`splash${hiding ? ' hide' : ''}`}>
           <div className="breathDot" />
@@ -639,18 +726,15 @@ export default function Home() {
         </div>
       )}
 
-      {/* APP */}
       {entered && (
         <div className="app">
-          {tab === 'home'        && <HomeScreen onNav={goTab} onOpenRitual={() => setShowRitual(true)} />}
-          {tab === 'mente'       && <MenteScreen />}
-          {tab === 'semana'      && <SemanaScreen />}
-          {tab === 'listas'      && <ListasScreen />}
+          {tab === 'home'        && <HomeScreen onNav={goTab} onOpenRitual={() => setShowRitual(true)} onLogout={handleLogout} />}
+          {tab === 'mente'       && <MenteScreen user={user} />}
+          {tab === 'semana'      && <SemanaScreen user={user} />}
+          {tab === 'listas'      && <ListasScreen user={user} />}
           {tab === 'noturno'     && <NoturnoScreen />}
           {tab === 'prioridades' && <PrioridadesScreen />}
-
           <Tabs active={tab} onChange={goTab} />
-
           {showRitual && <RitualModal onClose={() => setShowRitual(false)} />}
         </div>
       )}
